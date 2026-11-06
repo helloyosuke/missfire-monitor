@@ -184,7 +184,7 @@
 
   const $ = (id) => document.getElementById(id);
   let device = null, writeCh = null, rx = "", pending = null;
-  let activeNotify = null, probing = false, probeHit = null, lineEnd = "\r", idleTimer = null;
+  let activeNotify = null, probing = false, probeHit = null, probeText = {}, lineEnd = "\r", idleTimer = null;
   let polling = false, samples = [], pollStart = 0;
 
   // ---------- 画面の準備 ----------
@@ -246,6 +246,8 @@
         if (c.properties.notify || c.properties.indicate) notifies.push(c);
       }
     }
+    writes.sort((a, b) => Number(b.properties.writeWithoutResponse && !b.properties.write)
+                        - Number(a.properties.writeWithoutResponse && !a.properties.write));
     for (const n of notifies) {
       try { await n.startNotifications(); n.addEventListener("characteristicvaluechanged", onData); }
       catch (e) { addLog(`通知を有効にできません: ${n.uuid}`); }
@@ -257,7 +259,7 @@
     outer:
     for (const end of ["\r", "\r\n"]) {
       for (const w of writes) {
-        probeHit = null;
+        probeHit = null; probeText = {};
         addLog(`試行: ${w.uuid} に ATI（改行 ${end === "\r" ? "CR" : "CRLF"}）`);
         try { await writeRaw(w, "ATI" + end); } catch (e) { addLog(`  書き込み失敗: ${e.message}`); continue; }
         await sleep(1500);
@@ -309,7 +311,13 @@
   function onData(ev) {
     const ch = ev.target;
     const text = new TextDecoder().decode(ev.target.value);
-    if (probing) { probeHit = probeHit || ch; addLog(`  受信(${ch.uuid.slice(0, 8)}): ${printable(text)}`); return; }
+    if (probing) {
+      // ELM327らしい応答（ELM、OK、?、> を含む文字列）が返ってきた特性だけを採用する
+      probeText[ch.uuid] = (probeText[ch.uuid] || "") + text;
+      addLog(`  受信(${ch.uuid.slice(0, 8)}): ${printable(text)}`);
+      if (!probeHit && /ELM|STN|OBD|OK|\?|>/i.test(probeText[ch.uuid])) probeHit = ch;
+      return;
+    }
     if (activeNotify && ch !== activeNotify) { addLog(`別の特性から受信(${ch.uuid.slice(0, 8)}): ${printable(text)}`); return; }
     rx += text;
     clearTimeout(idleTimer);
