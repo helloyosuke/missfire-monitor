@@ -185,6 +185,7 @@
   const $ = (id) => document.getElementById(id);
   let device = null, writeCh = null, rx = "", pending = null;
   let activeNotify = null, probing = false, probeHit = null, probeText = {}, lineEnd = "\r", idleTimer = null;
+  let creditCh = null, consumed = 0;
   let polling = false, samples = [], pollStart = 0;
 
   // ---------- 画面の準備 ----------
@@ -253,6 +254,24 @@
       catch (e) { addLog(`通知を有効にできません: ${n.uuid}`); }
     }
 
+    // FlashProのBLEはTIのSPPLE（クレジット方式のシリアル通信）。決まった特性を使う
+    const byId = (u) => [...writes, ...notifies].find((c) => c.uuid.toLowerCase() === u);
+    const sp = {
+      rx: byId(SPPLE.rx), tx: byId(SPPLE.tx), txCredits: byId(SPPLE.txCredits), rxCredits: byId(SPPLE.rxCredits)
+    };
+    if (sp.rx && sp.tx && sp.txCredits) {
+      addLog("SPPLE方式で接続します");
+      writeCh = sp.rx; activeNotify = sp.tx; creditCh = sp.txCredits;
+      if (sp.rxCredits) {
+        try { const v = await sp.rxCredits.readValue(); addLog(`送信可能クレジット: ${le16(v)}`); } catch (e) {}
+      }
+      await grantCredits(512);                       // FlashProがこちらへ送れるバイト数を与える
+      await sleep(300);
+      rx = "";
+      await initELM();
+      return;
+    }
+
     // 書き込める特性に順番に "ATI" を送り、応答が返ってきた組み合わせを使う
     setStatus("通信経路を確認中…");
     probing = true;
@@ -272,6 +291,23 @@
     await sleep(300);
     rx = "";
     await initELM();
+  }
+
+  const SPPLE = {
+    tx: "0734594a-a8e7-4b1a-a6b1-cd5243059a57",        // FlashPro → iPhone（Notify）
+    txCredits: "ba04c4b2-892b-43be-b69c-5d13f2195392", // iPhoneが受け取れるバイト数を伝える
+    rx: "8b00ace7-eb0b-49b0-bbe9-9aee0a26e1a3",        // iPhone → FlashPro（WriteNoRsp）
+    rxCredits: "e06d5efb-4f4a-45c0-9eb1-371ae5a14ad4"  // FlashProが受け取れるバイト数（Notify）
+  };
+  const le16 = (dv) => dv.byteLength >= 2 ? dv.getUint16(0, true) : (dv.byteLength ? dv.getUint8(0) : 0);
+  async function grantCredits(n) {
+    if (!creditCh) return;
+    const b = new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
+    try {
+      if (creditCh.properties.write && creditCh.writeValueWithResponse) await creditCh.writeValueWithResponse(b);
+      else await creditCh.writeValue(b);
+      addLog(`クレジット付与: ${n}`);
+    } catch (e) { addLog(`クレジット付与に失敗: ${e.message}`); }
   }
 
   function isStandardService(uuid) {
@@ -294,7 +330,7 @@
   const printable = (t) => t.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/[^\x20-\x7e\\]/g, "·");
 
   function onDisconnect() {
-    polling = false; writeCh = null; activeNotify = null;
+    polling = false; writeCh = null; activeNotify = null; creditCh = null; consumed = 0;
     if (pending) { clearTimeout(pending.t); pending.reject(new Error("切断されました")); pending = null; }
     $("btnPoll").textContent = "読み取りを開始";
     setStatus("未接続"); setReady(false); addLog("切断");
@@ -318,7 +354,12 @@
       if (!probeHit && /ELM|STN|OBD|OK|\?|>/i.test(probeText[ch.uuid])) probeHit = ch;
       return;
     }
+    if (ch.uuid.toLowerCase() === SPPLE.rxCredits) return;   // 送信クレジットの通知は無視（送るコマンドが短いため）
     if (activeNotify && ch !== activeNotify) { addLog(`別の特性から受信(${ch.uuid.slice(0, 8)}): ${printable(text)}`); return; }
+    if (creditCh) {                                         // 受け取った分のクレジットを返す
+      consumed += ev.target.value.byteLength;
+      if (consumed >= 128) { const n = consumed; consumed = 0; grantCredits(n); }
+    }
     rx += text;
     clearTimeout(idleTimer);
     if (rx.includes(">")) { finishResponse(); return; }
