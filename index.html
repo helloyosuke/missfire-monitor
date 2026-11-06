@@ -409,7 +409,7 @@
       const d = dataTk.map((x) => parseInt(x, 16)).filter((x) => !isNaN(x));
       if (!d.length) continue;
       const pci = d[0] >> 4;
-      if (pci === 0) { const len = d[0] & 0x0f; if (len > 0 && d.length > len) out.push(d.slice(1, len + 1)); }
+      if (pci === 0) { const len = d[0] & 0x0f; if (len > 0) out.push(d.slice(1, len + 1)); }   // FlashProは長さを2多く書くことがあるので、ある分だけ使う
       else if (pci === 1 && d.length >= 2) { expected = ((d[0] & 0x0f) << 8) | d[1]; buf = d.slice(2); }
       else if (pci === 2) {
         buf = buf.concat(d.slice(1));
@@ -419,8 +419,15 @@
     return out;
   }
 
+  // FlashProの応答は先頭に「応答SID＋最初のPID」が重複して付くことがある（例: 46 A2 46 A2 …、41 0C 41 0C …）
+  function stripEcho(msg) {
+    if (msg.length >= 4 && msg[0] >= 0x40 && msg[0] === msg[2] && msg[1] === msg[3]) return msg.slice(2);
+    return msg;
+  }
+
   // 46 [MID TID UASID valH valL minH minL maxH maxL] ...
   function mode06(msg) {
+    msg = stripEcho(msg);
     const out = [];
     if (msg[0] !== 0x46) return out;
     for (let i = 1; i + 9 <= msg.length; i += 9) {
@@ -433,10 +440,11 @@
   // ---------- Mode 01（エンジンの状態） ----------
   // 1回のリクエストで最大6PIDまで。応答は 41 [PID データ] [PID データ] ... の形
   const PID_LEN = { 0x03: 2, 0x04: 1, 0x05: 1, 0x06: 1, 0x07: 1, 0x0C: 2, 0x0E: 1, 0x1F: 2 };
-  const PID_GROUPS = [[0x0C, 0x05, 0x06, 0x07, 0x0E, 0x1F], [0x03, 0x04]];
+  const PID_GROUPS = [[0x0C, 0x06, 0x07, 0x0E, 0x1F], [0x05, 0x03, 0x04]];   // 6PIDまとめると水温が返らなかったため分割
   let singlePidMode = false;   // 複数PIDの同時要求に応答しないECU向けの予備動作
 
   function mode01(msg) {
+    msg = stripEcho(msg);
     const out = {};
     if (msg[0] !== 0x41) return out;
     let i = 1;
@@ -479,6 +487,7 @@
   }
 
   function decodeDTCs(msg) {
+    msg = stripEcho(msg);
     const out = [];
     for (let i = 2; i + 1 < msg.length; i += 2) {
       const a = msg[i], b = msg[i + 1];
