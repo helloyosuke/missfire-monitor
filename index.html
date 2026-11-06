@@ -184,6 +184,7 @@
 
   const $ = (id) => document.getElementById(id);
   let device = null, writeCh = null, rx = "", pending = null;
+  let activeNotify = null, probing = false, probeHit = null, lineEnd = "\r", idleTimer = null;
   let polling = false, samples = [], pollStart = 0;
 
   // ---------- 画面の準備 ----------
@@ -233,41 +234,91 @@
     const server = await device.gatt.connect();
     addLog(`接続: ${device.name || "名称なし"}`);
 
-    let notifyCh = null;
+    // すべてのサービスと特性をログに出し、通知を受けられる特性はすべて購読する
+    const writes = [], notifies = [];
     const svcs = await server.getPrimaryServices();
     for (const svc of svcs) {
-      const chars = await svc.getCharacteristics();
-      const w = chars.find((c) => c.properties.write || c.properties.writeWithoutResponse);
-      const n = chars.find((c) => c.properties.notify || c.properties.indicate);
       addLog(`サービス ${svc.uuid}`);
-      if (w && n) { writeCh = w; notifyCh = n; addLog(`送信 ${w.uuid} / 受信 ${n.uuid}`); break; }
+      if (isStandardService(svc.uuid)) continue;     // 機器情報やファーム更新用のサービスには書き込まない
+      for (const c of await svc.getCharacteristics()) {
+        addLog(`  特性 ${c.uuid} [${propsText(c)}]`);
+        if (c.properties.write || c.properties.writeWithoutResponse) writes.push(c);
+        if (c.properties.notify || c.properties.indicate) notifies.push(c);
+      }
     }
-    if (!writeCh) {
-      throw new Error("通信用のサービスが見つかりません。接続設定にサービスUUIDを入力してから、もう一度接続してください。");
+    for (const n of notifies) {
+      try { await n.startNotifications(); n.addEventListener("characteristicvaluechanged", onData); }
+      catch (e) { addLog(`通知を有効にできません: ${n.uuid}`); }
     }
-    await notifyCh.startNotifications();
-    notifyCh.addEventListener("characteristicvaluechanged", onData);
+
+    // 書き込める特性に順番に "ATI" を送り、応答が返ってきた組み合わせを使う
+    setStatus("通信経路を確認中…");
+    probing = true;
+    outer:
+    for (const end of ["\r", "\r\n"]) {
+      for (const w of writes) {
+        probeHit = null;
+        addLog(`試行: ${w.uuid} に ATI（改行 ${end === "\r" ? "CR" : "CRLF"}）`);
+        try { await writeRaw(w, "ATI" + end); } catch (e) { addLog(`  書き込み失敗: ${e.message}`); continue; }
+        await sleep(1500);
+        if (probeHit) { writeCh = w; activeNotify = probeHit; lineEnd = end; break outer; }
+      }
+    }
+    probing = false;
+    if (!writeCh) throw new Error("どの特性からも応答がありません。通信ログのスクリーンショットを送ってください。");
+    addLog(`使用: 送信 ${writeCh.uuid} / 受信 ${activeNotify.uuid}`);
+    await sleep(300);
+    rx = "";
     await initELM();
   }
 
+  function isStandardService(uuid) {
+    const u = uuid.toLowerCase();
+    const sig = /^0000(1800|1801|180a|180f|fe59)-0000-1000-8000-00805f9b34fb$/;  // GAP/GATT/機器情報/電池/Nordic DFU
+    return sig.test(u) || u === "1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0";          // Silicon Labs OTA
+  }
+  function propsText(c) {
+    const p = c.properties, out = [];
+    if (p.read) out.push("Read"); if (p.write) out.push("Write"); if (p.writeWithoutResponse) out.push("WriteNoRsp");
+    if (p.notify) out.push("Notify"); if (p.indicate) out.push("Indicate");
+    return out.join(",");
+  }
+  function writeRaw(ch, text) {
+    const data = new TextEncoder().encode(text);
+    if (ch.properties.writeWithoutResponse && ch.writeValueWithoutResponse) return ch.writeValueWithoutResponse(data);
+    if (ch.properties.write && ch.writeValueWithResponse) return ch.writeValueWithResponse(data);
+    return ch.writeValue(data);
+  }
+  const printable = (t) => t.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/[^\x20-\x7e\\]/g, "·");
+
   function onDisconnect() {
-    polling = false; writeCh = null;
+    polling = false; writeCh = null; activeNotify = null;
     if (pending) { clearTimeout(pending.t); pending.reject(new Error("切断されました")); pending = null; }
     $("btnPoll").textContent = "読み取りを開始";
     setStatus("未接続"); setReady(false); addLog("切断");
   }
 
-  function onData(ev) {
-    rx += new TextDecoder().decode(ev.target.value);
-    const i = rx.indexOf(">");
-    if (i < 0) return;
-    const resp = rx.slice(0, i).trim();
+  function finishResponse(note) {
+    clearTimeout(idleTimer);
+    const resp = rx.replace(/>/g, "").trim();
     rx = "";
-    addLog(resp.replace(/\r/g, " | "));
+    addLog(resp.replace(/\r\n?|\n/g, " | ") + (note || ""));
     if (pending) { const p = pending; pending = null; clearTimeout(p.t); p.resolve(resp); }
   }
 
-  // ">" のプロンプトまでを1つの応答として受け取る
+  function onData(ev) {
+    const ch = ev.target;
+    const text = new TextDecoder().decode(ev.target.value);
+    if (probing) { probeHit = probeHit || ch; addLog(`  受信(${ch.uuid.slice(0, 8)}): ${printable(text)}`); return; }
+    if (activeNotify && ch !== activeNotify) { addLog(`別の特性から受信(${ch.uuid.slice(0, 8)}): ${printable(text)}`); return; }
+    rx += text;
+    clearTimeout(idleTimer);
+    if (rx.includes(">")) { finishResponse(); return; }
+    // ">" が来ない機器向け：0.5秒受信が止まったら応答の終わりとみなす
+    idleTimer = setTimeout(() => { if (pending && rx) finishResponse("（プロンプトなし）"); }, 500);
+  }
+
+  // ">" のプロンプト（または受信の途切れ）までを1つの応答として受け取る
   function send(cmd, timeout = 3000) {
     if (!writeCh) return Promise.reject(new Error("未接続です"));
     if (pending) return Promise.reject(new Error("前のコマンドの応答待ちです"));
@@ -278,18 +329,19 @@
         if (pending && pending.t === t) { pending = null; reject(new Error("応答がタイムアウトしました")); }
       }, timeout);
       pending = { resolve, reject, t };
-      const data = new TextEncoder().encode(cmd + "\r");
-      const write = (writeCh.properties.writeWithoutResponse && writeCh.writeValueWithoutResponse)
-        ? writeCh.writeValueWithoutResponse(data)
-        : writeCh.writeValue(data);
-      write.catch((e) => { if (pending && pending.t === t) { clearTimeout(t); pending = null; reject(e); } });
+      writeRaw(writeCh, cmd + lineEnd)
+        .catch((e) => { if (pending && pending.t === t) { clearTimeout(t); pending = null; reject(e); } });
     });
   }
 
   async function initELM() {
     setStatus("初期化中…");
     try { await send("ATZ", 5000); } catch (e) { addLog("ATZ: " + e.message); }
-    for (const c of ["ATE0", "ATL0", "ATS1", "ATH1", "ATSP7"]) await send(c, 2000);
+    let ok = 0;
+    for (const c of ["ATE0", "ATL0", "ATS1", "ATH1", "ATSP7"]) {
+      try { await send(c, 2000); ok++; } catch (e) { addLog(`${c}: ${e.message}`); }
+    }
+    if (ok === 0) throw new Error("初期化コマンドに応答がありません");
     setStatus("接続済み"); setReady(true);
   }
 
