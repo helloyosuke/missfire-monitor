@@ -60,6 +60,13 @@
   .bore .d { font-size: 12px; font-weight: 700; color: var(--amber); min-height: 1.2em; }
   .bore.hit { border-color: var(--amber); background: var(--amber-soft); }
   @media (prefers-reduced-motion: reduce) { .bore { transition: none; } }
+  .readout {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px;
+    margin-top: 14px; padding: 12px 6px 0; border-top: 1px solid var(--line);
+  }
+  .readout div { display: flex; flex-direction: column; }
+  .readout span { font-size: 12px; color: var(--muted); }
+  .readout b { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
 
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .row > button { flex: 1; }
@@ -102,6 +109,14 @@
       <span class="note">IG ON からの累計失火回数</span>
     </div>
     <div class="bores" id="bores"></div>
+    <div class="readout">
+      <div><span>水温</span><b id="vEct">—</b></div>
+      <div><span>回転数</span><b id="vRpm">—</b></div>
+      <div><span>点火時期</span><b id="vIgn">—</b></div>
+      <div><span>短期補正</span><b id="vStft">—</b></div>
+      <div><span>長期補正</span><b id="vLtft">—</b></div>
+      <div><span>燃料制御</span><b id="vFs">—</b></div>
+    </div>
   </div>
 
   <div class="row">
@@ -314,6 +329,54 @@
     return out;
   }
 
+  // ---------- Mode 01（エンジンの状態） ----------
+  // 1回のリクエストで最大6PIDまで。応答は 41 [PID データ] [PID データ] ... の形
+  const PID_LEN = { 0x03: 2, 0x04: 1, 0x05: 1, 0x06: 1, 0x07: 1, 0x0C: 2, 0x0E: 1, 0x1F: 2 };
+  const PID_GROUPS = [[0x0C, 0x05, 0x06, 0x07, 0x0E, 0x1F], [0x03, 0x04]];
+  let singlePidMode = false;   // 複数PIDの同時要求に応答しないECU向けの予備動作
+
+  function mode01(msg) {
+    const out = {};
+    if (msg[0] !== 0x41) return out;
+    let i = 1;
+    while (i < msg.length) {
+      const pid = msg[i], len = PID_LEN[pid];
+      if (len == null || i + 1 + len > msg.length) break;
+      out[pid] = msg.slice(i + 1, i + 1 + len);
+      i += 1 + len;
+    }
+    return out;
+  }
+
+  function decodeEngine(p) {
+    const v = {};
+    if (p[0x0C]) v.rpm = ((p[0x0C][0] << 8) | p[0x0C][1]) / 4;
+    if (p[0x05]) v.ect = p[0x05][0] - 40;
+    if (p[0x06]) v.stft = (p[0x06][0] - 128) * 100 / 128;
+    if (p[0x07]) v.ltft = (p[0x07][0] - 128) * 100 / 128;
+    if (p[0x0E]) v.ign = p[0x0E][0] / 2 - 64;
+    if (p[0x1F]) v.run = (p[0x1F][0] << 8) | p[0x1F][1];
+    if (p[0x04]) v.load = p[0x04][0] * 100 / 255;
+    if (p[0x03]) v.fs = p[0x03][0];
+    return v;
+  }
+
+  const FUEL_STATUS = { 1: "オープン", 2: "フィードバック", 4: "オープン（減速等）", 8: "オープン（故障）", 16: "フィードバック（異常）" };
+
+  async function readEngine() {
+    const merged = {};
+    const groups = singlePidMode ? PID_GROUPS.flat().map((x) => [x]) : PID_GROUPS;
+    for (const g of groups) {
+      try {
+        const raw = await send("01" + g.map(hex2).join(""));
+        for (const m of isotp(raw, ECM)) Object.assign(merged, mode01(m));
+      } catch (e) { addLog(e.message); }
+    }
+    // 複数PIDでまとめて読めなかったら、次回から1PIDずつ読む
+    if (!singlePidMode && merged[0x0C] == null) { singlePidMode = true; addLog("1PIDずつの読み取りに切り替えます"); }
+    return decodeEngine(merged);
+  }
+
   function decodeDTCs(msg) {
     const out = [];
     for (let i = 2; i + 1 < msg.length; i += 2) {
@@ -328,6 +391,7 @@
   async function pollLoop() {
     while (polling) {
       const counts = [null, null, null, null], ewma = [null, null, null, null];
+      const eng = await readEngine();
       for (let i = 0; i < 4 && polling; i++) {
         const mid = 0xA2 + i;                     // A2〜A5 = 1〜4番気筒
         try {
@@ -340,7 +404,7 @@
         } catch (e) { addLog(e.message); }
       }
       if (!polling) break;
-      samples.push({ date: new Date(), t: (Date.now() - pollStart) / 1000, counts, ewma });
+      samples.push({ date: new Date(), t: (Date.now() - pollStart) / 1000, counts, ewma, eng });
       render();
       await sleep(Number($("interval").value) * 1000);
     }
@@ -357,6 +421,14 @@
       el.querySelector(".d").textContent = d > 0 ? `+${d}` : "";
       el.classList.toggle("hit", d > 0);
     }
+    const e = last.eng || {};
+    const fmt = (x, d, u) => (x == null ? "—" : x.toFixed(d) + u);
+    $("vEct").textContent = fmt(e.ect, 0, " ℃");
+    $("vRpm").textContent = fmt(e.rpm, 0, " rpm");
+    $("vIgn").textContent = fmt(e.ign, 1, "°");
+    $("vStft").textContent = fmt(e.stft, 1, " %");
+    $("vLtft").textContent = fmt(e.ltft, 1, " %");
+    $("vFs").textContent = e.fs == null ? "—" : (FUEL_STATUS[e.fs] || e.fs);
     drawChart();
     $("btnCsv").disabled = $("btnCopy").disabled = samples.length === 0;
   }
@@ -394,9 +466,13 @@
   // ---------- CSV ----------
   function csvText() {
     const f = (v) => (v == null ? "" : v);
-    let s = "time,elapsed_s,cyl1,cyl2,cyl3,cyl4,ewma1,ewma2,ewma3,ewma4\n";
+    const r = (v, d) => (v == null ? "" : v.toFixed(d));
+    let s = "time,elapsed_s,run_s,rpm,ect_c,stft_pct,ltft_pct,ign_deg,load_pct,fuel_status,"
+          + "cyl1,cyl2,cyl3,cyl4,ewma1,ewma2,ewma3,ewma4\n";
     for (const x of samples) {
-      s += [x.date.toISOString(), x.t.toFixed(1), ...x.counts.map(f), ...x.ewma.map(f)].join(",") + "\n";
+      const e = x.eng || {};
+      s += [x.date.toISOString(), x.t.toFixed(1), f(e.run), r(e.rpm, 0), f(e.ect), r(e.stft, 1), r(e.ltft, 1),
+            r(e.ign, 1), r(e.load, 1), f(e.fs), ...x.counts.map(f), ...x.ewma.map(f)].join(",") + "\n";
     }
     return s;
   }
