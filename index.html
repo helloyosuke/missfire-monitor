@@ -60,6 +60,7 @@
   .bore .d { font-size: 12px; font-weight: 700; color: var(--amber); min-height: 1.2em; }
   .bore.hit { border-color: var(--amber); background: var(--amber-soft); }
   @media (prefers-reduced-motion: reduce) { .bore { transition: none; } }
+  .readout[hidden] { display: none; }
   .readout {
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px;
     margin-top: 14px; padding: 12px 6px 0; border-top: 1px solid var(--line);
@@ -109,7 +110,7 @@
       <span class="note">IG ON からの累計失火回数</span>
     </div>
     <div class="bores" id="bores"></div>
-    <div class="readout">
+    <div class="readout" id="readout" hidden>
       <div><span>水温</span><b id="vEct">—</b></div>
       <div><span>回転数</span><b id="vRpm">—</b></div>
       <div><span>点火時期</span><b id="vIgn">—</b></div>
@@ -127,7 +128,10 @@
       <option value="5">5秒ごと</option>
     </select>
   </div>
-  <p class="hint">エンジン始動の直後に開始すると、失火がどの時間帯で増えるかが分かります。</p>
+  <label class="hint" style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+    <input type="checkbox" id="withEngine"> 水温・回転数・燃料補正なども一緒に読む（読み取りが遅くなります）
+  </label>
+  <p class="hint">エンジン始動の直後に開始すると、失火がどの時間帯で増えるかが分かります。記録中は画面がつきっぱなしになります。Bluefyを裏に回すと記録が止まるので、前面に出したままにしてください。</p>
 
   <section>
     <h2>推移</h2>
@@ -330,7 +334,7 @@
   const printable = (t) => t.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/[^\x20-\x7e\\]/g, "·");
 
   function onDisconnect() {
-    polling = false; writeCh = null; activeNotify = null; creditCh = null; consumed = 0;
+    polling = false; keepAwake(false); writeCh = null; activeNotify = null; creditCh = null; consumed = 0;
     if (pending) { clearTimeout(pending.t); pending.reject(new Error("切断されました")); pending = null; }
     $("btnPoll").textContent = "読み取りを開始";
     setStatus("未接続"); setReady(false); addLog("切断");
@@ -439,8 +443,8 @@
 
   // ---------- Mode 01（エンジンの状態） ----------
   // 1回のリクエストで最大6PIDまで。応答は 41 [PID データ] [PID データ] ... の形
-  const PID_LEN = { 0x03: 2, 0x04: 1, 0x05: 1, 0x06: 1, 0x07: 1, 0x0C: 2, 0x0E: 1, 0x1F: 2 };
-  const PID_GROUPS = [[0x0C, 0x06, 0x07, 0x0E, 0x1F], [0x05, 0x03, 0x04]];   // 6PIDまとめると水温が返らなかったため分割
+  const PID_LEN = { 0x03: 2, 0x04: 1, 0x05: 1, 0x06: 1, 0x07: 1, 0x0C: 2, 0x0E: 1, 0x1F: 2, 0x67: 3 };
+  const PID_GROUPS = [[0x0C, 0x06, 0x07, 0x0E, 0x1F], [0x67, 0x03, 0x04]];   // 水温はPID 05ではなく67（水温センサー2個）で返ってくる
   let singlePidMode = false;   // 複数PIDの同時要求に応答しないECU向けの予備動作
 
   function mode01(msg) {
@@ -461,6 +465,11 @@
     const v = {};
     if (p[0x0C]) v.rpm = ((p[0x0C][0] << 8) | p[0x0C][1]) / 4;
     if (p[0x05]) v.ect = p[0x05][0] - 40;
+    if (p[0x67]) {                                   // A: 対応ビット, B: センサー1, C: センサー2（各 −40℃）
+      const [a, b, c] = p[0x67];
+      if (a & 1) v.ect = b - 40;
+      if (a & 2) v.ect2 = c - 40;
+    }
     if (p[0x06]) v.stft = (p[0x06][0] - 128) * 100 / 128;
     if (p[0x07]) v.ltft = (p[0x07][0] - 128) * 100 / 128;
     if (p[0x0E]) v.ign = p[0x0E][0] / 2 - 64;
@@ -497,11 +506,30 @@
     return out;
   }
 
+  // ---------- 画面の常時点灯（記録中だけ） ----------
+  let wakeLock = null;
+  async function keepAwake(on) {
+    try {
+      if (on) {
+        if (!("wakeLock" in navigator)) { addLog("このブラウザは画面の常時点灯に対応していません。自動ロックを「なし」にしてください"); return; }
+        if (!wakeLock) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          wakeLock.addEventListener("release", () => { wakeLock = null; });
+          addLog("記録中は画面を点灯したままにします");
+        }
+      } else if (wakeLock) { await wakeLock.release(); wakeLock = null; }
+    } catch (e) { addLog("画面の常時点灯に失敗: " + e.message); }
+  }
+  // 別のアプリから戻ってきたら、記録中なら点灯を取り直す
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && polling) keepAwake(true);
+  });
+
   // ---------- 失火モニター ----------
   async function pollLoop() {
     while (polling) {
       const counts = [null, null, null, null], ewma = [null, null, null, null];
-      const eng = await readEngine();
+      const eng = $("withEngine").checked ? await readEngine() : {};
       for (let i = 0; i < 4 && polling; i++) {
         const mid = 0xA2 + i;                     // A2〜A5 = 1〜4番気筒
         try {
@@ -531,6 +559,7 @@
       el.querySelector(".d").textContent = d > 0 ? `+${d}` : "";
       el.classList.toggle("hit", d > 0);
     }
+    $("readout").hidden = !$("withEngine").checked;
     const e = last.eng || {};
     const fmt = (x, d, u) => (x == null ? "—" : x.toFixed(d) + u);
     $("vEct").textContent = fmt(e.ect, 0, " ℃");
@@ -577,11 +606,11 @@
   function csvText() {
     const f = (v) => (v == null ? "" : v);
     const r = (v, d) => (v == null ? "" : v.toFixed(d));
-    let s = "time,elapsed_s,run_s,rpm,ect_c,stft_pct,ltft_pct,ign_deg,load_pct,fuel_status,"
+    let s = "time,elapsed_s,run_s,rpm,ect_c,ect2_c,stft_pct,ltft_pct,ign_deg,load_pct,fuel_status,"
           + "cyl1,cyl2,cyl3,cyl4,ewma1,ewma2,ewma3,ewma4\n";
     for (const x of samples) {
       const e = x.eng || {};
-      s += [x.date.toISOString(), x.t.toFixed(1), f(e.run), r(e.rpm, 0), f(e.ect), r(e.stft, 1), r(e.ltft, 1),
+      s += [x.date.toISOString(), x.t.toFixed(1), f(e.run), r(e.rpm, 0), f(e.ect), f(e.ect2), r(e.stft, 1), r(e.ltft, 1),
             r(e.ign, 1), r(e.load, 1), f(e.fs), ...x.counts.map(f), ...x.ewma.map(f)].join(",") + "\n";
     }
     return s;
@@ -605,7 +634,8 @@
   };
 
   $("btnPoll").onclick = () => {
-    if (polling) { polling = false; $("btnPoll").textContent = "読み取りを開始"; setReady(true); return; }
+    if (polling) { polling = false; keepAwake(false); $("btnPoll").textContent = "読み取りを開始"; setReady(true); return; }
+    keepAwake(true);
     samples = []; pollStart = Date.now(); polling = true;
     $("btnPoll").textContent = "読み取りを停止"; setReady(true);
     pollLoop();
